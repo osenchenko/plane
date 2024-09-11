@@ -4,7 +4,7 @@ from .project.base import (
     ProjectUserViewsEndpoint,
     ProjectFavoritesViewSet,
     ProjectPublicCoverImagesEndpoint,
-    ProjectDeployBoardViewSet,
+    DeployBoardViewSet,
     ProjectArchiveUnarchiveEndpoint,
 )
 
@@ -28,11 +28,8 @@ from .user.base import (
     UserActivityEndpoint,
 )
 
-from .oauth import OauthEndpoint
 
-from .oidc import OIDCEndpoint
-
-from .base import BaseAPIView, BaseViewSet, WebhookMixin
+from .base import BaseAPIView, BaseViewSet
 
 from .workspace.base import (
     WorkSpaceViewSet,
@@ -40,7 +37,7 @@ from .workspace.base import (
     WorkSpaceAvailabilityCheckEndpoint,
     UserWorkspaceDashboardEndpoint,
     WorkspaceThemeViewSet,
-    ExportWorkspaceUserActivityEndpoint
+    ExportWorkspaceUserActivityEndpoint,
 )
 
 from .workspace.member import (
@@ -83,8 +80,8 @@ from .workspace.cycle import (
 
 from .state.base import StateViewSet
 from .view.base import (
-    GlobalViewViewSet,
-    GlobalViewIssuesViewSet,
+    WorkspaceViewViewSet,
+    WorkspaceViewIssuesViewSet,
     IssueViewViewSet,
     IssueViewFavoriteViewSet,
 )
@@ -93,11 +90,15 @@ from .cycle.base import (
     CycleDateCheckEndpoint,
     CycleFavoriteViewSet,
     TransferCycleIssueEndpoint,
-    CycleArchiveUnarchiveEndpoint,
     CycleUserPropertiesEndpoint,
+    CycleViewSet,
+    TransferCycleIssueEndpoint,
 )
 from .cycle.issue import (
     CycleIssueViewSet,
+)
+from .cycle.archive import (
+    CycleArchiveUnarchiveEndpoint,
 )
 
 from .asset.base import FileAssetEndpoint, UserAssetsEndpoint, FileAssetViewSet
@@ -112,9 +113,7 @@ from .issue.activity import (
     IssueActivityEndpoint,
 )
 
-from .issue.archive import (
-    IssueArchiveViewSet,
-)
+from .issue.archive import IssueArchiveViewSet, BulkArchiveIssuesEndpoint
 
 from .issue.attachment import (
     IssueAttachmentEndpoint,
@@ -152,32 +151,22 @@ from .issue.subscriber import (
     IssueSubscriberViewSet,
 )
 
-from .auth_extended import (
-    ForgotPasswordEndpoint,
-    ResetPasswordEndpoint,
-    ChangePasswordEndpoint,
-    SetUserPasswordEndpoint,
-    EmailCheckEndpoint,
-    MagicGenerateEndpoint,
-)
 
-
-from .authentication import (
-    SignInEndpoint,
-    SignOutEndpoint,
-    MagicSignInEndpoint,
-)
+from .issue.bulk_operations import BulkIssueOperationsEndpoint
 
 from .module.base import (
     ModuleViewSet,
     ModuleLinkViewSet,
     ModuleFavoriteViewSet,
-    ModuleArchiveUnarchiveEndpoint,
     ModuleUserPropertiesEndpoint,
 )
 
 from .module.issue import (
     ModuleIssueViewSet,
+)
+
+from .module.archive import (
+    ModuleArchiveUnarchiveEndpoint,
 )
 
 from .api import ApiTokenEndpoint
@@ -188,19 +177,22 @@ from .page.base import (
     PageFavoriteViewSet,
     PageLogEndpoint,
     SubPagesEndpoint,
+    PagesDescriptionViewSet,
 )
 
-from .search import GlobalSearchEndpoint, IssueSearchEndpoint
+from .search.base import GlobalSearchEndpoint
+from .search.issue import IssueSearchEndpoint
 
 
 from .external.base import (
     GPTIntegrationEndpoint,
     UnsplashEndpoint,
+    WorkspaceGPTIntegrationEndpoint,
 )
-
 from .estimate.base import (
     ProjectEstimatePointEndpoint,
     BulkEstimatePointEndpoint,
+    EstimatePointEndpoint,
 )
 
 from .inbox.base import InboxViewSet, InboxIssueViewSet
@@ -216,13 +208,11 @@ from .analytic.base import (
 from .notification.base import (
     NotificationViewSet,
     UnreadNotificationEndpoint,
-    MarkAllReadNotificationViewSet,
     UserNotificationPreferenceEndpoint,
 )
 
 from .exporter.base import ExportIssuesEndpoint
 
-from .config import ConfigurationEndpoint, MobileConfigurationEndpoint
 
 from .webhook.base import (
     WebhookEndpoint,
@@ -233,3 +223,7 @@ from .webhook.base import (
 from .dashboard.base import DashboardEndpoint, WidgetsEndpoint
 
 from .error_404 import custom_404_view
+
+from .exporter.base import ExportIssuesEndpoint
+from .notification.base import MarkAllReadNotificationViewSet
+from .user.base import AccountEndpoint, ProfileEndpoint, UserSessionEndpoint

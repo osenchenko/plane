@@ -1,52 +1,53 @@
 # Django imports
-from django.db.models import (
-    Q,
-    Case,
-    When,
-    Value,
-    CharField,
-    Count,
-    F,
-    Exists,
-    OuterRef,
-    Subquery,
-    JSONField,
-    Func,
-    Prefetch,
-    IntegerField,
-)
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.contrib.postgres.fields import ArrayField
-from django.db.models import UUIDField
+from django.db.models import (
+    Case,
+    CharField,
+    Count,
+    Exists,
+    F,
+    Func,
+    IntegerField,
+    JSONField,
+    OuterRef,
+    Prefetch,
+    Q,
+    Subquery,
+    UUIDField,
+    Value,
+    When,
+)
 from django.db.models.functions import Coalesce
 from django.utils import timezone
+from rest_framework import status
 
 # Third Party imports
 from rest_framework.response import Response
-from rest_framework import status
+
+from plane.app.serializers import (
+    DashboardSerializer,
+    IssueActivitySerializer,
+    IssueSerializer,
+    WidgetSerializer,
+)
+from plane.db.models import (
+    Dashboard,
+    DashboardWidget,
+    Issue,
+    IssueActivity,
+    IssueAttachment,
+    IssueLink,
+    IssueRelation,
+    Project,
+    ProjectMember,
+    User,
+    Widget,
+)
+from plane.utils.issue_filters import issue_filters
 
 # Module imports
 from .. import BaseAPIView
-from plane.db.models import (
-    Issue,
-    IssueActivity,
-    ProjectMember,
-    Widget,
-    DashboardWidget,
-    Dashboard,
-    Project,
-    IssueLink,
-    IssueAttachment,
-    IssueRelation,
-    User,
-)
-from plane.app.serializers import (
-    IssueActivitySerializer,
-    IssueSerializer,
-    DashboardSerializer,
-    WidgetSerializer,
-)
-from plane.utils.issue_filters import issue_filters
 
 
 def dashboard_overview_stats(self, request, slug):
@@ -571,14 +572,16 @@ def dashboard_recent_collaborators(self, request, slug):
     return self.paginate(
         request=request,
         queryset=project_members_with_activities,
-        controller=self.get_results_controller,
+        controller=lambda qs: self.get_results_controller(qs, slug),
     )
 
 
 class DashboardEndpoint(BaseAPIView):
-    def get_results_controller(self, project_members_with_activities):
+    def get_results_controller(self, project_members_with_activities, slug):
         user_active_issue_counts = (
-            User.objects.filter(id__in=project_members_with_activities)
+            User.objects.filter(
+                id__in=project_members_with_activities,
+            )
             .annotate(
                 active_issue_count=Count(
                     Case(
@@ -587,10 +590,13 @@ class DashboardEndpoint(BaseAPIView):
                                 "unstarted",
                                 "started",
                             ],
-                            then=1,
+                            issue_assignee__issue__workspace__slug=slug,
+                            issue_assignee__issue__project__project_projectmember__is_active=True,
+                            then=F("issue_assignee__issue__id"),
                         ),
                         output_field=IntegerField(),
-                    )
+                    ),
+                    distinct=True,
                 )
             )
             .values("active_issue_count", user_id=F("id"))

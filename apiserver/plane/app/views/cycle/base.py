@@ -1,10 +1,9 @@
 # Python imports
 import json
 
+# Django imports
 from django.contrib.postgres.aggregates import ArrayAgg
 from django.contrib.postgres.fields import ArrayField
-
-# Django imports
 from django.db.models import (
     Case,
     CharField,
@@ -18,20 +17,22 @@ from django.db.models import (
     UUIDField,
     Value,
     When,
+    Subquery,
+    Sum,
+    FloatField,
 )
-from django.db.models.functions import Coalesce
+from django.db.models.functions import Coalesce, Cast
 from django.utils import timezone
+from django.core.serializers.json import DjangoJSONEncoder
 
 # Third party imports
 from rest_framework import status
 from rest_framework.response import Response
-
 from plane.app.permissions import (
     ProjectEntityPermission,
     ProjectLitePermission,
 )
 from plane.app.serializers import (
-    CycleFavoriteSerializer,
     CycleSerializer,
     CycleUserPropertiesSerializer,
     CycleWriteSerializer,
@@ -39,20 +40,22 @@ from plane.app.serializers import (
 from plane.bgtasks.issue_activites_task import issue_activity
 from plane.db.models import (
     Cycle,
-    CycleFavorite,
     CycleIssue,
+    UserFavorite,
     CycleUserProperties,
     Issue,
     Label,
     User,
+    Project,
 )
 from plane.utils.analytics_plot import burndown_plot
 
 # Module imports
-from .. import BaseAPIView, BaseViewSet, WebhookMixin
+from .. import BaseAPIView, BaseViewSet
+from plane.bgtasks.webhook_task import model_activity
 
 
-class CycleViewSet(WebhookMixin, BaseViewSet):
+class CycleViewSet(BaseViewSet):
     serializer_class = CycleSerializer
     model = Cycle
     webhook_event = "cycle"
@@ -67,11 +70,95 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
         )
 
     def get_queryset(self):
-        favorite_subquery = CycleFavorite.objects.filter(
+        favorite_subquery = UserFavorite.objects.filter(
             user=self.request.user,
-            cycle_id=OuterRef("pk"),
+            entity_identifier=OuterRef("pk"),
+            entity_type="cycle",
             project_id=self.kwargs.get("project_id"),
             workspace__slug=self.kwargs.get("slug"),
+        )
+        backlog_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                state__group="backlog",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                backlog_estimate_point=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("backlog_estimate_point")[:1]
+        )
+        unstarted_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                state__group="unstarted",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                unstarted_estimate_point=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("unstarted_estimate_point")[:1]
+        )
+        started_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                state__group="started",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                started_estimate_point=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("started_estimate_point")[:1]
+        )
+        cancelled_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                state__group="cancelled",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                cancelled_estimate_point=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("cancelled_estimate_point")[:1]
+        )
+        completed_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                state__group="completed",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                completed_estimate_points=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("completed_estimate_points")[:1]
+        )
+        total_estimate_point = (
+            Issue.issue_objects.filter(
+                estimate_point__estimate__type="points",
+                issue_cycle__cycle_id=OuterRef("pk"),
+            )
+            .values("issue_cycle__cycle_id")
+            .annotate(
+                total_estimate_points=Sum(
+                    Cast("estimate_point__value", FloatField())
+                )
+            )
+            .values("total_estimate_points")[:1]
         )
         return self.filter_queryset(
             super()
@@ -197,6 +284,42 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                     Value([], output_field=ArrayField(UUIDField())),
                 )
             )
+            .annotate(
+                backlog_estimate_points=Coalesce(
+                    Subquery(backlog_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
+            .annotate(
+                unstarted_estimate_points=Coalesce(
+                    Subquery(unstarted_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
+            .annotate(
+                started_estimate_points=Coalesce(
+                    Subquery(started_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
+            .annotate(
+                cancelled_estimate_points=Coalesce(
+                    Subquery(cancelled_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
+            .annotate(
+                completed_estimate_points=Coalesce(
+                    Subquery(completed_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
+            .annotate(
+                total_estimate_points=Coalesce(
+                    Subquery(total_estimate_point),
+                    Value(0, output_field=FloatField()),
+                ),
+            )
             .order_by("-is_favorite", "name")
             .distinct()
         )
@@ -231,7 +354,14 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "external_source",
                 "external_id",
                 "progress_snapshot",
+                "logo_props",
                 # meta fields
+                "backlog_estimate_points",
+                "unstarted_estimate_points",
+                "started_estimate_points",
+                "cancelled_estimate_points",
+                "completed_estimate_points",
+                "total_estimate_points",
                 "is_favorite",
                 "total_issues",
                 "cancelled_issues",
@@ -241,9 +371,110 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "backlog_issues",
                 "assignee_ids",
                 "status",
+                "created_by",
             )
+            estimate_type = Project.objects.filter(
+                workspace__slug=slug,
+                pk=project_id,
+                estimate__isnull=False,
+                estimate__type="points",
+            ).exists()
 
             if data:
+                data[0]["estimate_distribution"] = {}
+                if estimate_type:
+                    assignee_distribution = (
+                        Issue.objects.filter(
+                            issue_cycle__cycle_id=data[0]["id"],
+                            workspace__slug=slug,
+                            project_id=project_id,
+                        )
+                        .annotate(display_name=F("assignees__display_name"))
+                        .annotate(assignee_id=F("assignees__id"))
+                        .annotate(avatar=F("assignees__avatar"))
+                        .values("display_name", "assignee_id", "avatar")
+                        .annotate(
+                            total_estimates=Sum(
+                                Cast("estimate_point__value", FloatField())
+                            )
+                        )
+                        .annotate(
+                            completed_estimates=Sum(
+                                Cast("estimate_point__value", FloatField()),
+                                filter=Q(
+                                    completed_at__isnull=False,
+                                    archived_at__isnull=True,
+                                    is_draft=False,
+                                ),
+                            )
+                        )
+                        .annotate(
+                            pending_estimates=Sum(
+                                Cast("estimate_point__value", FloatField()),
+                                filter=Q(
+                                    completed_at__isnull=True,
+                                    archived_at__isnull=True,
+                                    is_draft=False,
+                                ),
+                            )
+                        )
+                        .order_by("display_name")
+                    )
+
+                    label_distribution = (
+                        Issue.objects.filter(
+                            issue_cycle__cycle_id=data[0]["id"],
+                            workspace__slug=slug,
+                            project_id=project_id,
+                        )
+                        .annotate(label_name=F("labels__name"))
+                        .annotate(color=F("labels__color"))
+                        .annotate(label_id=F("labels__id"))
+                        .values("label_name", "color", "label_id")
+                        .annotate(
+                            total_estimates=Sum(
+                                Cast("estimate_point__value", FloatField())
+                            )
+                        )
+                        .annotate(
+                            completed_estimates=Sum(
+                                Cast("estimate_point__value", FloatField()),
+                                filter=Q(
+                                    completed_at__isnull=False,
+                                    archived_at__isnull=True,
+                                    is_draft=False,
+                                ),
+                            )
+                        )
+                        .annotate(
+                            pending_estimates=Sum(
+                                Cast("estimate_point__value", FloatField()),
+                                filter=Q(
+                                    completed_at__isnull=True,
+                                    archived_at__isnull=True,
+                                    is_draft=False,
+                                ),
+                            )
+                        )
+                        .order_by("label_name")
+                    )
+                    data[0]["estimate_distribution"] = {
+                        "assignees": assignee_distribution,
+                        "labels": label_distribution,
+                        "completion_chart": {},
+                    }
+
+                    if data[0]["start_date"] and data[0]["end_date"]:
+                        data[0]["estimate_distribution"]["completion_chart"] = (
+                            burndown_plot(
+                                queryset=queryset.first(),
+                                slug=slug,
+                                project_id=project_id,
+                                plot_type="points",
+                                cycle_id=data[0]["id"],
+                            )
+                        )
+
                 assignee_distribution = (
                     Issue.objects.filter(
                         issue_cycle__cycle_id=data[0]["id"],
@@ -257,7 +488,10 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                     .annotate(
                         total_issues=Count(
                             "id",
-                            filter=Q(archived_at__isnull=True, is_draft=False),
+                            filter=Q(
+                                archived_at__isnull=True,
+                                is_draft=False,
+                            ),
                         ),
                     )
                     .annotate(
@@ -296,8 +530,11 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                     .annotate(
                         total_issues=Count(
                             "id",
-                            filter=Q(archived_at__isnull=True, is_draft=False),
-                        )
+                            filter=Q(
+                                archived_at__isnull=True,
+                                is_draft=False,
+                            ),
+                        ),
                     )
                     .annotate(
                         completed_issues=Count(
@@ -333,6 +570,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                             queryset=queryset.first(),
                             slug=slug,
                             project_id=project_id,
+                            plot_type="issues",
                             cycle_id=data[0]["id"],
                         )
                     )
@@ -355,7 +593,10 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
             "external_source",
             "external_id",
             "progress_snapshot",
+            "logo_props",
             # meta fields
+            "completed_estimate_points",
+            "total_estimate_points",
             "is_favorite",
             "total_issues",
             "cancelled_issues",
@@ -365,6 +606,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
             "backlog_issues",
             "assignee_ids",
             "status",
+            "created_by",
         )
         return Response(data, status=status.HTTP_200_OK)
 
@@ -401,6 +643,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                         "external_source",
                         "external_id",
                         "progress_snapshot",
+                        "logo_props",
                         # meta fields
                         "is_favorite",
                         "cancelled_issues",
@@ -413,6 +656,17 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                         "status",
                     )
                     .first()
+                )
+
+                # Send the model activity
+                model_activity.delay(
+                    model_name="cycle",
+                    model_id=str(cycle["id"]),
+                    requested_data=request.data,
+                    current_instance=None,
+                    actor_id=request.user.id,
+                    slug=slug,
+                    origin=request.META.get("HTTP_ORIGIN"),
                 )
                 return Response(cycle, status=status.HTTP_201_CREATED)
             return Response(
@@ -436,6 +690,11 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 {"error": "Archived cycle cannot be updated"},
                 status=status.HTTP_400_BAD_REQUEST,
             )
+
+        current_instance = json.dumps(
+            CycleSerializer(cycle).data, cls=DjangoJSONEncoder
+        )
+
         request_data = request.data
 
         if (
@@ -478,6 +737,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "external_source",
                 "external_id",
                 "progress_snapshot",
+                "logo_props",
                 # meta fields
                 "is_favorite",
                 "total_issues",
@@ -489,6 +749,18 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "assignee_ids",
                 "status",
             ).first()
+
+            # Send the model activity
+            model_activity.delay(
+                model_name="cycle",
+                model_id=str(cycle["id"]),
+                requested_data=request.data,
+                current_instance=current_instance,
+                actor_id=request.user.id,
+                slug=slug,
+                origin=request.META.get("HTTP_ORIGIN"),
+            )
+
             return Response(cycle, status=status.HTTP_200_OK)
         return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
 
@@ -526,6 +798,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "external_id",
                 "progress_snapshot",
                 "sub_issues",
+                "logo_props",
                 # meta fields
                 "is_favorite",
                 "total_issues",
@@ -536,16 +809,112 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 "backlog_issues",
                 "assignee_ids",
                 "status",
+                "created_by",
             )
             .first()
         )
         queryset = queryset.first()
 
-        if data is None:
-            return Response(
-                {"error": "Cycle does not exist"},
-                status=status.HTTP_400_BAD_REQUEST,
+        estimate_type = Project.objects.filter(
+            workspace__slug=slug,
+            pk=project_id,
+            estimate__isnull=False,
+            estimate__type="points",
+        ).exists()
+
+        data["estimate_distribution"] = {}
+        if estimate_type:
+            assignee_distribution = (
+                Issue.objects.filter(
+                    issue_cycle__cycle_id=pk,
+                    workspace__slug=slug,
+                    project_id=project_id,
+                )
+                .annotate(display_name=F("assignees__display_name"))
+                .annotate(assignee_id=F("assignees__id"))
+                .annotate(avatar=F("assignees__avatar"))
+                .values("display_name", "assignee_id", "avatar")
+                .annotate(
+                    total_estimates=Sum(
+                        Cast("estimate_point__value", FloatField())
+                    )
+                )
+                .annotate(
+                    completed_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=False,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .annotate(
+                    pending_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=True,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .order_by("display_name")
             )
+
+            label_distribution = (
+                Issue.objects.filter(
+                    issue_cycle__cycle_id=pk,
+                    workspace__slug=slug,
+                    project_id=project_id,
+                )
+                .annotate(label_name=F("labels__name"))
+                .annotate(color=F("labels__color"))
+                .annotate(label_id=F("labels__id"))
+                .values("label_name", "color", "label_id")
+                .annotate(
+                    total_estimates=Sum(
+                        Cast("estimate_point__value", FloatField())
+                    )
+                )
+                .annotate(
+                    completed_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=False,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .annotate(
+                    pending_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=True,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .order_by("label_name")
+            )
+            data["estimate_distribution"] = {
+                "assignees": assignee_distribution,
+                "labels": label_distribution,
+                "completion_chart": {},
+            }
+
+            if data["start_date"] and data["end_date"]:
+                data["estimate_distribution"]["completion_chart"] = (
+                    burndown_plot(
+                        queryset=queryset,
+                        slug=slug,
+                        project_id=project_id,
+                        plot_type="points",
+                        cycle_id=pk,
+                    )
+                )
 
         # Assignee Distribution
         assignee_distribution = (
@@ -569,7 +938,10 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
             .annotate(
                 total_issues=Count(
                     "id",
-                    filter=Q(archived_at__isnull=True, is_draft=False),
+                    filter=Q(
+                        archived_at__isnull=True,
+                        is_draft=False,
+                    ),
                 ),
             )
             .annotate(
@@ -609,7 +981,10 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
             .annotate(
                 total_issues=Count(
                     "id",
-                    filter=Q(archived_at__isnull=True, is_draft=False),
+                    filter=Q(
+                        archived_at__isnull=True,
+                        is_draft=False,
+                    ),
                 ),
             )
             .annotate(
@@ -646,6 +1021,7 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
                 queryset=queryset,
                 slug=slug,
                 project_id=project_id,
+                plot_type="issues",
                 cycle_id=pk,
             )
 
@@ -686,380 +1062,6 @@ class CycleViewSet(WebhookMixin, BaseViewSet):
         return Response(status=status.HTTP_204_NO_CONTENT)
 
 
-class CycleArchiveUnarchiveEndpoint(BaseAPIView):
-
-    permission_classes = [
-        ProjectEntityPermission,
-    ]
-
-    def get_queryset(self):
-        favorite_subquery = CycleFavorite.objects.filter(
-            user=self.request.user,
-            cycle_id=OuterRef("pk"),
-            project_id=self.kwargs.get("project_id"),
-            workspace__slug=self.kwargs.get("slug"),
-        )
-        return (
-            Cycle.objects.filter(workspace__slug=self.kwargs.get("slug"))
-            .filter(project_id=self.kwargs.get("project_id"))
-            .filter(archived_at__isnull=False)
-            .filter(
-                project__project_projectmember__member=self.request.user,
-                project__project_projectmember__is_active=True,
-            )
-            .filter(project__archived_at__isnull=True)
-            .select_related("project", "workspace", "owned_by")
-            .prefetch_related(
-                Prefetch(
-                    "issue_cycle__issue__assignees",
-                    queryset=User.objects.only(
-                        "avatar", "first_name", "id"
-                    ).distinct(),
-                )
-            )
-            .prefetch_related(
-                Prefetch(
-                    "issue_cycle__issue__labels",
-                    queryset=Label.objects.only(
-                        "name", "color", "id"
-                    ).distinct(),
-                )
-            )
-            .annotate(is_favorite=Exists(favorite_subquery))
-            .annotate(
-                total_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                completed_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__state__group="completed",
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                cancelled_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__state__group="cancelled",
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                started_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__state__group="started",
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                unstarted_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__state__group="unstarted",
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                backlog_issues=Count(
-                    "issue_cycle__issue__id",
-                    distinct=True,
-                    filter=Q(
-                        issue_cycle__issue__state__group="backlog",
-                        issue_cycle__issue__archived_at__isnull=True,
-                        issue_cycle__issue__is_draft=False,
-                    ),
-                )
-            )
-            .annotate(
-                status=Case(
-                    When(
-                        Q(start_date__lte=timezone.now())
-                        & Q(end_date__gte=timezone.now()),
-                        then=Value("CURRENT"),
-                    ),
-                    When(
-                        start_date__gt=timezone.now(), then=Value("UPCOMING")
-                    ),
-                    When(end_date__lt=timezone.now(), then=Value("COMPLETED")),
-                    When(
-                        Q(start_date__isnull=True) & Q(end_date__isnull=True),
-                        then=Value("DRAFT"),
-                    ),
-                    default=Value("DRAFT"),
-                    output_field=CharField(),
-                )
-            )
-            .annotate(
-                assignee_ids=Coalesce(
-                    ArrayAgg(
-                        "issue_cycle__issue__assignees__id",
-                        distinct=True,
-                        filter=~Q(
-                            issue_cycle__issue__assignees__id__isnull=True
-                        ),
-                    ),
-                    Value([], output_field=ArrayField(UUIDField())),
-                )
-            )
-            .order_by("-is_favorite", "name")
-            .distinct()
-        )
-
-    def get(self, request, slug, project_id, pk=None):
-        if pk is None:
-            queryset = (
-                self.get_queryset()
-                .annotate(
-                    total_issues=Count(
-                        "issue_cycle",
-                        filter=Q(
-                            issue_cycle__issue__archived_at__isnull=True,
-                            issue_cycle__issue__is_draft=False,
-                        ),
-                    )
-                )
-                .values(
-                    # necessary fields
-                    "id",
-                    "workspace_id",
-                    "project_id",
-                    # model fields
-                    "name",
-                    "description",
-                    "start_date",
-                    "end_date",
-                    "owned_by_id",
-                    "view_props",
-                    "sort_order",
-                    "external_source",
-                    "external_id",
-                    "progress_snapshot",
-                    # meta fields
-                    "total_issues",
-                    "is_favorite",
-                    "cancelled_issues",
-                    "completed_issues",
-                    "started_issues",
-                    "unstarted_issues",
-                    "backlog_issues",
-                    "assignee_ids",
-                    "status",
-                    "archived_at",
-                )
-            ).order_by("-is_favorite", "-created_at")
-            return Response(queryset, status=status.HTTP_200_OK)
-        else:
-            queryset = (
-                self.get_queryset()
-                .filter(archived_at__isnull=False)
-                .filter(pk=pk)
-            )
-            data = (
-                self.get_queryset()
-                .filter(pk=pk)
-                .annotate(
-                    sub_issues=Issue.issue_objects.filter(
-                        project_id=self.kwargs.get("project_id"),
-                        parent__isnull=False,
-                        issue_cycle__cycle_id=pk,
-                    )
-                    .order_by()
-                    .annotate(count=Func(F("id"), function="Count"))
-                    .values("count")
-                )
-                .values(
-                    # necessary fields
-                    "id",
-                    "workspace_id",
-                    "project_id",
-                    # model fields
-                    "name",
-                    "description",
-                    "start_date",
-                    "end_date",
-                    "owned_by_id",
-                    "view_props",
-                    "sort_order",
-                    "external_source",
-                    "external_id",
-                    "progress_snapshot",
-                    "sub_issues",
-                    # meta fields
-                    "is_favorite",
-                    "total_issues",
-                    "cancelled_issues",
-                    "completed_issues",
-                    "started_issues",
-                    "unstarted_issues",
-                    "backlog_issues",
-                    "assignee_ids",
-                    "status",
-                )
-                .first()
-            )
-            queryset = queryset.first()
-
-            if data is None:
-                return Response(
-                    {"error": "Cycle does not exist"},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-
-            # Assignee Distribution
-            assignee_distribution = (
-                Issue.objects.filter(
-                    issue_cycle__cycle_id=pk,
-                    workspace__slug=slug,
-                    project_id=project_id,
-                )
-                .annotate(first_name=F("assignees__first_name"))
-                .annotate(last_name=F("assignees__last_name"))
-                .annotate(assignee_id=F("assignees__id"))
-                .annotate(avatar=F("assignees__avatar"))
-                .annotate(display_name=F("assignees__display_name"))
-                .values(
-                    "first_name",
-                    "last_name",
-                    "assignee_id",
-                    "avatar",
-                    "display_name",
-                )
-                .annotate(
-                    total_issues=Count(
-                        "id",
-                        filter=Q(archived_at__isnull=True, is_draft=False),
-                    ),
-                )
-                .annotate(
-                    completed_issues=Count(
-                        "id",
-                        filter=Q(
-                            completed_at__isnull=False,
-                            archived_at__isnull=True,
-                            is_draft=False,
-                        ),
-                    )
-                )
-                .annotate(
-                    pending_issues=Count(
-                        "id",
-                        filter=Q(
-                            completed_at__isnull=True,
-                            archived_at__isnull=True,
-                            is_draft=False,
-                        ),
-                    )
-                )
-                .order_by("first_name", "last_name")
-            )
-
-            # Label Distribution
-            label_distribution = (
-                Issue.objects.filter(
-                    issue_cycle__cycle_id=pk,
-                    workspace__slug=slug,
-                    project_id=project_id,
-                )
-                .annotate(label_name=F("labels__name"))
-                .annotate(color=F("labels__color"))
-                .annotate(label_id=F("labels__id"))
-                .values("label_name", "color", "label_id")
-                .annotate(
-                    total_issues=Count(
-                        "id",
-                        filter=Q(archived_at__isnull=True, is_draft=False),
-                    ),
-                )
-                .annotate(
-                    completed_issues=Count(
-                        "id",
-                        filter=Q(
-                            completed_at__isnull=False,
-                            archived_at__isnull=True,
-                            is_draft=False,
-                        ),
-                    )
-                )
-                .annotate(
-                    pending_issues=Count(
-                        "id",
-                        filter=Q(
-                            completed_at__isnull=True,
-                            archived_at__isnull=True,
-                            is_draft=False,
-                        ),
-                    )
-                )
-                .order_by("label_name")
-            )
-
-            data["distribution"] = {
-                "assignees": assignee_distribution,
-                "labels": label_distribution,
-                "completion_chart": {},
-            }
-
-            if queryset.start_date and queryset.end_date:
-                data["distribution"]["completion_chart"] = burndown_plot(
-                    queryset=queryset,
-                    slug=slug,
-                    project_id=project_id,
-                    cycle_id=pk,
-                )
-
-            return Response(
-                data,
-                status=status.HTTP_200_OK,
-            )
-
-    def post(self, request, slug, project_id, cycle_id):
-        cycle = Cycle.objects.get(
-            pk=cycle_id, project_id=project_id, workspace__slug=slug
-        )
-
-        if cycle.end_date >= timezone.now().date():
-            return Response(
-                {"error": "Only completed cycles can be archived"},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-
-        cycle.archived_at = timezone.now()
-        cycle.save()
-        return Response(
-            {"archived_at": str(cycle.archived_at)},
-            status=status.HTTP_200_OK,
-        )
-
-    def delete(self, request, slug, project_id, cycle_id):
-        cycle = Cycle.objects.get(
-            pk=cycle_id, project_id=project_id, workspace__slug=slug
-        )
-        cycle.archived_at = None
-        cycle.save()
-        return Response(status=status.HTTP_204_NO_CONTENT)
-
-
 class CycleDateCheckEndpoint(BaseAPIView):
     permission_classes = [
         ProjectEntityPermission,
@@ -1097,8 +1099,7 @@ class CycleDateCheckEndpoint(BaseAPIView):
 
 
 class CycleFavoriteViewSet(BaseViewSet):
-    serializer_class = CycleFavoriteSerializer
-    model = CycleFavorite
+    model = UserFavorite
 
     def get_queryset(self):
         return self.filter_queryset(
@@ -1110,18 +1111,21 @@ class CycleFavoriteViewSet(BaseViewSet):
         )
 
     def create(self, request, slug, project_id):
-        serializer = CycleFavoriteSerializer(data=request.data)
-        if serializer.is_valid():
-            serializer.save(user=request.user, project_id=project_id)
-            return Response(serializer.data, status=status.HTTP_201_CREATED)
-        return Response(serializer.errors, status=status.HTTP_400_BAD_REQUEST)
+        _ = UserFavorite.objects.create(
+            project_id=project_id,
+            user=request.user,
+            entity_type="cycle",
+            entity_identifier=request.data.get("cycle"),
+        )
+        return Response(status=status.HTTP_204_NO_CONTENT)
 
     def destroy(self, request, slug, project_id, cycle_id):
-        cycle_favorite = CycleFavorite.objects.get(
+        cycle_favorite = UserFavorite.objects.get(
             project=project_id,
+            entity_type="cycle",
             user=request.user,
             workspace__slug=slug,
-            cycle_id=cycle_id,
+            entity_identifier=cycle_id,
         )
         cycle_favorite.delete()
         return Response(status=status.HTTP_204_NO_CONTENT)
@@ -1210,17 +1214,131 @@ class TransferCycleIssueEndpoint(BaseAPIView):
             )
         )
 
-        # Pass the new_cycle queryset to burndown_plot
-        completion_chart = burndown_plot(
-            queryset=old_cycle.first(),
-            slug=slug,
-            project_id=project_id,
-            cycle_id=cycle_id,
-        )
+        estimate_type = Project.objects.filter(
+            workspace__slug=slug,
+            pk=project_id,
+            estimate__isnull=False,
+            estimate__type="points",
+        ).exists()
+
+        if estimate_type:
+            assignee_estimate_data = (
+                Issue.issue_objects.filter(
+                    issue_cycle__cycle_id=cycle_id,
+                    workspace__slug=slug,
+                    project_id=project_id,
+                )
+                .annotate(display_name=F("assignees__display_name"))
+                .annotate(assignee_id=F("assignees__id"))
+                .annotate(avatar=F("assignees__avatar"))
+                .values("display_name", "assignee_id", "avatar")
+                .annotate(
+                    total_estimates=Sum(
+                        Cast("estimate_point__value", FloatField())
+                    )
+                )
+                .annotate(
+                    completed_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=False,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .annotate(
+                    pending_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=True,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .order_by("display_name")
+            )
+            # assignee distribution serialization
+            assignee_estimate_distribution = [
+                {
+                    "display_name": item["display_name"],
+                    "assignee_id": (
+                        str(item["assignee_id"])
+                        if item["assignee_id"]
+                        else None
+                    ),
+                    "avatar": item["avatar"],
+                    "total_estimates": item["total_estimates"],
+                    "completed_estimates": item["completed_estimates"],
+                    "pending_estimates": item["pending_estimates"],
+                }
+                for item in assignee_estimate_data
+            ]
+
+            label_distribution_data = (
+                Issue.issue_objects.filter(
+                    issue_cycle__cycle_id=cycle_id,
+                    workspace__slug=slug,
+                    project_id=project_id,
+                )
+                .annotate(label_name=F("labels__name"))
+                .annotate(color=F("labels__color"))
+                .annotate(label_id=F("labels__id"))
+                .values("label_name", "color", "label_id")
+                .annotate(
+                    total_estimates=Sum(
+                        Cast("estimate_point__value", FloatField())
+                    )
+                )
+                .annotate(
+                    completed_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=False,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .annotate(
+                    pending_estimates=Sum(
+                        Cast("estimate_point__value", FloatField()),
+                        filter=Q(
+                            completed_at__isnull=True,
+                            archived_at__isnull=True,
+                            is_draft=False,
+                        ),
+                    )
+                )
+                .order_by("label_name")
+            )
+
+            estimate_completion_chart = burndown_plot(
+                queryset=old_cycle.first(),
+                slug=slug,
+                project_id=project_id,
+                plot_type="points",
+                cycle_id=cycle_id,
+            )
+            # Label distribution serialization
+            label_estimate_distribution = [
+                {
+                    "label_name": item["label_name"],
+                    "color": item["color"],
+                    "label_id": (
+                        str(item["label_id"]) if item["label_id"] else None
+                    ),
+                    "total_estimates": item["total_estimates"],
+                    "completed_estimates": item["completed_estimates"],
+                    "pending_estimates": item["pending_estimates"],
+                }
+                for item in label_distribution_data
+            ]
 
         # Get the assignee distribution
         assignee_distribution = (
-            Issue.objects.filter(
+            Issue.issue_objects.filter(
                 issue_cycle__cycle_id=cycle_id,
                 workspace__slug=slug,
                 project_id=project_id,
@@ -1232,7 +1350,10 @@ class TransferCycleIssueEndpoint(BaseAPIView):
             .annotate(
                 total_issues=Count(
                     "id",
-                    filter=Q(archived_at__isnull=True, is_draft=False),
+                    filter=Q(
+                        archived_at__isnull=True,
+                        is_draft=False,
+                    ),
                 ),
             )
             .annotate(
@@ -1274,7 +1395,7 @@ class TransferCycleIssueEndpoint(BaseAPIView):
 
         # Get the label distribution
         label_distribution = (
-            Issue.objects.filter(
+            Issue.issue_objects.filter(
                 issue_cycle__cycle_id=cycle_id,
                 workspace__slug=slug,
                 project_id=project_id,
@@ -1286,8 +1407,11 @@ class TransferCycleIssueEndpoint(BaseAPIView):
             .annotate(
                 total_issues=Count(
                     "id",
-                    filter=Q(archived_at__isnull=True, is_draft=False),
-                )
+                    filter=Q(
+                        archived_at__isnull=True,
+                        is_draft=False,
+                    ),
+                ),
             )
             .annotate(
                 completed_issues=Count(
@@ -1312,20 +1436,6 @@ class TransferCycleIssueEndpoint(BaseAPIView):
             .order_by("label_name")
         )
 
-        assignee_distribution_data = [
-            {
-                "display_name": item["display_name"],
-                "assignee_id": (
-                    str(item["assignee_id"]) if item["assignee_id"] else None
-                ),
-                "avatar": item["avatar"],
-                "total_issues": item["total_issues"],
-                "completed_issues": item["completed_issues"],
-                "pending_issues": item["pending_issues"],
-            }
-            for item in assignee_distribution
-        ]
-
         # Label distribution serilization
         label_distribution_data = [
             {
@@ -1340,6 +1450,15 @@ class TransferCycleIssueEndpoint(BaseAPIView):
             }
             for item in label_distribution
         ]
+
+        # Pass the new_cycle queryset to burndown_plot
+        completion_chart = burndown_plot(
+            queryset=old_cycle.first(),
+            slug=slug,
+            project_id=project_id,
+            plot_type="issues",
+            cycle_id=cycle_id,
+        )
 
         current_cycle = Cycle.objects.filter(
             workspace__slug=slug, project_id=project_id, pk=cycle_id
@@ -1357,6 +1476,15 @@ class TransferCycleIssueEndpoint(BaseAPIView):
                 "assignees": assignee_distribution_data,
                 "completion_chart": completion_chart,
             },
+            "estimate_distribution": (
+                {}
+                if not estimate_type
+                else {
+                    "labels": label_estimate_distribution,
+                    "assignees": assignee_estimate_distribution,
+                    "completion_chart": estimate_completion_chart,
+                }
+            ),
         }
         current_cycle.save(update_fields=["progress_snapshot"])
 
